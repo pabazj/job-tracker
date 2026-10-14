@@ -57,6 +57,26 @@ If a site captures the wrong text, select the job description before clicking th
 
 ![Confirmation panel shown after clicking the bookmark on a job page](docs/screenshots/bookmarklet-capture.png)
 
+## What the percentage means
+
+The percentage on each job is a **CV fit score**: how much of what the job asks for your CV covers, weighted by how much each part matters. It is not a probability. 80% doesn't mean 8 out of 10 applications like this get an interview; it means your CV shows most of what this job wants.
+
+| Score | Colour | Meaning |
+|---|---|---|
+| 70% and above | Green | Strong match. You meet most must-haves; worth applying. |
+| 45–69% | Amber | Partial match. Some important requirements are missing or only partly shown. |
+| Under 45% | Red | Long shot. Major gaps, or the job isn't open to you (location or work authorisation). |
+
+It becomes useful when you compare it with what actually happens:
+
+- **High score, no interview:** your skills match on paper, so the problem is more likely how your CV reads (formatting, keywords, what's in the first few lines), applying late, or the level you're applying at. If this keeps happening, change the CV and see whether the next version does better.
+- **Low score, no interview:** expected. The gaps listed on the card are what to work on or address in the application.
+- **Interviews that don't turn into offers:** the CV is doing its job; look at which round types you drop out at.
+
+The **Stats** tab does this comparison for you, by score range, job site and CV version. The numbers start to mean something after about 20–30 applications.
+
+The score saved when you mark a job as applied stays fixed, even if you later update your CV and re-score, so Stats always compares against what the employer actually saw.
+
 ## How the score works
 
 The model doesn't pick a number. It rates each requirement as matched, partial or missing and points to the evidence in your CV, then the score is calculated in code from fixed weights:

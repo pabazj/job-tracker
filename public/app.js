@@ -38,6 +38,8 @@ const reachedInterview = (j) => j.reachedInterview || rounds(j).length > 0 || ['
 // Screening outcome: did the CV get an interview? Later rejections still count as a yes.
 const outcome = (j) => (reachedInterview(j) ? 'pos' : ['Rejected', 'Ghosted'].includes(j.status) ? 'neg' : 'pending');
 const scoreClass = (s) => (s >= 70 ? 'high' : s >= 45 ? 'mid' : 'low');
+const SCORE_LABELS = { high: 'strong match', mid: 'partial match', low: 'long shot' };
+const scoreLabel = (s) => SCORE_LABELS[scoreClass(s)];
 const options = (values, selected) => values.map((v) => `<option value="${esc(v)}" ${v === selected ? 'selected' : ''}>${esc(v || '—')}</option>`).join('');
 const withValue = (values, value) => (values.includes(value) || !value ? values : [value, ...values]);
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
@@ -209,7 +211,7 @@ function scoreBadge(j) {
   if (isBusy(j)) return '<div class="score busy" title="Analysing">…</div>';
   const s = j.analysis?.score;
   if (s == null) return '<div class="score" title="Not scored yet">—</div>';
-  return `<div class="score ${scoreClass(s)}" title="Estimated interview chance">${s}%</div>`;
+  return `<div class="score ${scoreClass(s)}" title="CV fit: ${s}%, ${scoreLabel(s)}. How much of this job's requirements your CV covers.">${s}%</div>`;
 }
 
 function flags(j) {
@@ -435,6 +437,11 @@ function analysisHtml(j) {
   const changed = j.appliedScore != null && j.appliedScore !== a.score;
   return `
     <div class="verdict">${esc(a.verdict)}</div>
+    <p class="hint score-meaning">
+      <b>${a.score}% fit, ${scoreLabel(a.score)}</b> (70%+ strong, 45–69% partial, under 45% long shot).
+      This is how much of the job's requirements your CV covers, weighted as below. It isn't a probability:
+      if strong matches keep getting no interview, look at how your CV reads. The Stats tab tracks this.
+    </p>
     ${a.breakdown.map((b) => `<div class="bar-row">
       <span>${esc(b.label)} <span class="muted small">(${b.weight})</span></span>
       <div class="bar"><i style="width:${Math.round(b.value * 100)}%"></i></div>
