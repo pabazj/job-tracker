@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Job Tracker</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Job Tracker</h1>
+    <nav>
+      <button data-tab="wishlist">Wishlist <span class="count" id="count-wishlist"></span></button>
+      <button data-tab="applied">Applied <span class="count" id="count-applied"></span></button>
+      <button data-tab="stats">Stats</button>
+      <button data-tab="cv">My CV</button>
+    </nav>
+    <div class="header-right">
+      <span id="aiStatus"></span>
+      <button class="secondary small" data-action="exportCsv">Export CSV</button>
+    </div>
+  </header>
+  <main id="main"></main>
+  <div id="toast"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

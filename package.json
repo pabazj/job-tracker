@@ -1,0 +1,17 @@
+{
+  "name": "job-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local job application tracker with JD parsing and CV fit scoring via Ollama",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.22.3"
+  }
+}
