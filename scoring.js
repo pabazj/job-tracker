@@ -44,3 +44,13 @@ export function computeScore(details, a) {
   if (a.locationFit === 'blocked') score = Math.min(score, BLOCKED_CAP);
   return { score, breakdown: parts };
 }
+
+export function fitsFromAnalysis(analysis) {
+  const detail = (key) => analysis?.breakdown?.find((b) => b.key === key)?.detail;
+  return {
+    candidateYears: analysis?.candidateYears ?? 0,
+    seniorityFit: detail('seniority') || 'unclear',
+    locationFit: detail('location') || 'unclear',
+    domainFit: detail('domain') || 'none',
+  };
+}

@@ -4,6 +4,7 @@ import express from 'express';
 import { db, save } from './db.js';
 import { MODEL, assessFit, extractDetails, generatePrepAnswers, generatePrepProcess, ollamaStatus } from './llm.js';
 import { computeScore } from './scoring.js';
+import { adviseGap, dismissGap, rankGaps } from './gaps.js';
 import { checkStillOpen, detectSource, fetchJobText, parseInput } from './fetchjob.js';
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -64,9 +65,13 @@ async function buildPrep(job) {
   const gaps = a
     ? [...a.mustHave, ...a.niceToHave].filter((r) => r.match !== 'yes').map((r) => r.requirement).concat(a.missingKeywords)
     : [];
+  const matched = a
+    ? [...a.mustHave, ...a.niceToHave].filter((r) => r.match === 'yes').map((r) => r.requirement)
+    : [];
   const round = nextRound(job);
   const progress = {
     gaps: [...new Set(gaps)].slice(0, 8),
+    matched: [...new Set(matched)].slice(0, 12),
     nextRound: round,
     passedRounds: job.rounds.filter((r) => r.result === 'passed').map((r) => r.type),
   };
@@ -142,6 +147,7 @@ async function analyse(job) {
     }
     job.details = details;
     if (!job.expectedRounds && details.interviewRounds) job.expectedRounds = String(details.interviewRounds);
+    save();
   }
 
   const cv = currentCv();
@@ -356,10 +362,39 @@ app.put('/api/cv', (req, res) => {
 });
 
 app.post('/api/rescore-all', (_req, res) => {
-  const jobs = db.jobs.filter((j) => j.details && (j.state === 'ready' || j.state === 'error'));
+  const skip = new Set(['Rejected', 'Offer', 'Ghosted']);
+  const jobs = db.jobs.filter((j) => j.details && (j.state === 'ready' || j.state === 'error') && !(j.list === 'applied' && skip.has(j.status)));
   jobs.forEach(enqueue);
   res.json({ queued: jobs.length });
 });
+
+app.get('/api/gaps', async (req, res) => {
+  try {
+    const list = ['wishlist', 'applied'].includes(req.query.list) ? req.query.list : 'all';
+    const includeLongShots = req.query.longShots === '1';
+    res.json(await rankGaps({ list, q: String(req.query.q || ''), includeLongShots, cv: currentCv() }));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/gaps/:id/advise', async (req, res) => {
+  try {
+    res.json(await adviseGap(req.params.id, currentCv()));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post('/api/gaps/:id/dismiss', (req, res) => {
+  dismissGap(req.params.id, req.body?.dismissed !== false);
+  res.json({ ok: true });
+});
+
+db.skillGroups ??= [];
+db.dismissedGaps ??= [];
+db.gapAdvice ??= {};
 
 for (const job of db.jobs) {
   job.rounds ??= [];

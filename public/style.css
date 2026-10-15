@@ -269,3 +269,13 @@ td .bar { width: 100px; display: inline-block; vertical-align: middle; margin-ri
 #toast.show { opacity: 1; }
 
 .empty { text-align: center; color: var(--muted); padding: 2rem; }
+
+.gap .job-head { padding: .5rem 0; }
+.gap-jobs { margin: .2rem 0 1rem; padding-left: 1.2rem; }
+.gap-mini { display: flex; justify-content: space-between; align-items: center; padding: .35rem 0; border-bottom: 1px solid var(--border); }
+.advice { margin: .75rem 0; padding: .75rem 1rem; border-radius: 8px; background: #f8faff; }
+.advice.have_it { background: #f0fdf4; }
+.advice.close { background: #fffbeb; }
+.advice.not_in_experience { background: #fef2f2; }
+label.inline { display: inline-flex; align-items: center; gap: .4rem; font-weight: 400; }
+label.inline input { width: auto; }

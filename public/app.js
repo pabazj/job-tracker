@@ -16,13 +16,27 @@ const SCORE_BUCKETS = ['80–100%', '60–79%', '40–59%', '0–39%', 'Unscored
 let state = { jobs: [], cv: null, ollama: {}, model: '' };
 let lastJson = '';
 let pendingRender = false;
-let tab = ['wishlist', 'applied', 'stats', 'cv'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'wishlist';
+let tab = ['wishlist', 'applied', 'stats', 'gaps', 'cv'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'wishlist';
+let gapData = { gaps: [], totalJobs: 0 };
+let gapOpen = null;
+let gapShowAll = false;
+let gapBusy = false;
 let captured = readCapture();
 const expanded = new Set();
 const openSections = new Set();
 const jdCache = new Map();
 const drafts = {};
-const filters = { wishlist: { q: '' }, applied: { q: '', status: '' } };
+const filters = { wishlist: { q: '', sort: 'newest' }, applied: { q: '', status: '', sort: 'newest' }, gaps: { q: '', list: 'all', longShots: '' } };
+const PRIORITY_RANK = { High: 3, Medium: 2, Low: 1 };
+const SORTS = {
+  newest: 'Newest first',
+  oldest: 'Oldest first',
+  scoreHigh: 'Highest score',
+  scoreLow: 'Lowest score',
+  deadline: 'Deadline soonest',
+  priority: 'Priority',
+  nextInterview: 'Next interview',
+};
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -148,7 +162,7 @@ function render() {
   renderAiStatus();
 
   const main = $('#main');
-  main.innerHTML = tab === 'stats' ? statsView() : tab === 'cv' ? cvView() : listView(tab);
+  main.innerHTML = tab === 'stats' ? statsView() : tab === 'cv' ? cvView() : tab === 'gaps' ? gapsView() : listView(tab);
   main.querySelectorAll('[data-draft]').forEach((el) => {
     if (drafts[el.dataset.draft] != null) el.value = drafts[el.dataset.draft];
   });
@@ -186,20 +200,65 @@ function listView(list) {
     <div class="toolbar">
       <input data-filter="q" data-list="${list}" placeholder="Search company, role, site…" value="${esc(f.q)}">
       ${isApplied ? `<select data-filter="status" data-list="${list}">${options(['', ...STATUSES], f.status).replace('>—<', '>All statuses<')}</select>` : ''}
+      <select data-filter="sort" data-list="${list}" title="Sort">
+        ${sortOptions(list, f.sort)}
+      </select>
     </div>
     <div id="jobs">${jobsHtml(list)}</div>`;
+}
+
+function sortOptions(list, selected) {
+  const keys = list === 'applied'
+    ? ['newest', 'oldest', 'scoreHigh', 'scoreLow', 'nextInterview']
+    : ['newest', 'oldest', 'scoreHigh', 'scoreLow', 'deadline', 'priority'];
+  return keys.map((k) => `<option value="${k}" ${k === selected ? 'selected' : ''}>${SORTS[k]}</option>`).join('');
+}
+
+function listDate(j) {
+  return (j.list === 'applied' ? j.appliedAt : j.savedAt) || j.createdAt || '';
+}
+
+function nextInterviewDate(j) {
+  const pending = rounds(j).filter((r) => r.result === 'pending' && r.date).map((r) => r.date).sort();
+  return pending[0] || '';
+}
+
+function cmp(a, b) {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function sortJobs(jobs, list, sort) {
+  const byDate = (a, b) => cmp(listDate(a), listDate(b)) || cmp(a.createdAt, b.createdAt);
+  const score = (j) => j.analysis?.score;
+  switch (sort) {
+    case 'oldest':
+      return jobs.sort(byDate);
+    case 'scoreHigh':
+      return jobs.sort((a, b) => (score(b) ?? -1) - (score(a) ?? -1) || byDate(b, a));
+    case 'scoreLow':
+      return jobs.sort((a, b) => (score(a) ?? 101) - (score(b) ?? 101) || byDate(b, a));
+    case 'deadline':
+      return jobs.sort((a, b) => cmp(a.deadline || '9999', b.deadline || '9999') || byDate(b, a));
+    case 'priority':
+      return jobs.sort((a, b) => (PRIORITY_RANK[b.priority] || 0) - (PRIORITY_RANK[a.priority] || 0) || byDate(b, a));
+    case 'nextInterview':
+      return jobs.sort((a, b) => cmp(nextInterviewDate(a) || '9999', nextInterviewDate(b) || '9999') || byDate(b, a));
+    default:
+      return jobs.sort((a, b) => byDate(b, a));
+  }
 }
 
 function jobsHtml(list) {
   const f = filters[list];
   const q = f.q.toLowerCase();
-  const jobs = state.jobs
-    .filter((j) => j.list === list)
-    .filter((j) => !f.status || j.status === f.status)
-    .filter((j) => !q || [j.details?.company, j.details?.role, j.source, j.url, j.notes].join(' ').toLowerCase().includes(q))
-    .sort(list === 'wishlist'
-      ? (a, b) => (b.analysis?.score ?? -1) - (a.analysis?.score ?? -1)
-      : (a, b) => (b.appliedAt || '').localeCompare(a.appliedAt || '') || b.createdAt.localeCompare(a.createdAt));
+  const jobs = sortJobs(
+    state.jobs
+      .filter((j) => j.list === list)
+      .filter((j) => !f.status || j.status === f.status)
+      .filter((j) => !q || [j.details?.company, j.details?.role, j.source, j.url, j.notes].join(' ').toLowerCase().includes(q)),
+    list,
+    f.sort,
+  );
 
   if (!jobs.length) {
     return `<div class="empty">${state.jobs.some((j) => j.list === list) ? 'No jobs match your filters.' : 'Nothing here yet. Paste a job above.'}</div>`;
@@ -665,6 +724,98 @@ function cvView() {
   </section>`;
 }
 
+const HONESTY = {
+  have_it: 'You have it — it just isn’t named',
+  close: 'Close, but not the same. Reword carefully',
+  not_in_experience: 'Not in your experience — don’t add it',
+};
+
+let gapsLoading = null;
+async function loadGaps() {
+  if (gapsLoading) return gapsLoading;
+  gapBusy = true;
+  gapsLoading = (async () => {
+    try {
+      const f = filters.gaps;
+      gapData = await api(`/api/gaps?list=${encodeURIComponent(f.list)}&q=${encodeURIComponent(f.q)}&longShots=${f.longShots ? 1 : 0}`);
+    } finally {
+      gapBusy = false;
+      gapsLoading = null;
+    }
+  })();
+  return gapsLoading;
+}
+
+function gapsView() {
+  const f = filters.gaps;
+  const all = gapData.gaps || [];
+  const query = f.q.trim().toLowerCase();
+  const visible = all.filter((g) => !g.dismissed && (!query || g.name.toLowerCase().includes(query) || g.phrases.some((p) => p.toLowerCase().includes(query))));
+  const hidden = all.filter((g) => g.dismissed);
+  const shown = gapShowAll ? visible : visible.slice(0, 15);
+  if (!state.cv) {
+    return `<section class="card empty">Add your CV in the <b>My CV</b> tab first. This tab ranks skills jobs ask for that your CV doesn’t clearly show.</section>`;
+  }
+  if (gapBusy && !gapData.totalJobs) {
+    return '<section class="card empty">Grouping skills across your jobs. First time takes about half a minute…</section>';
+  }
+  if (!gapData.totalJobs) {
+    return '<section class="card empty">Score a few jobs first. Gaps are built from the must-haves and nice-to-haves on each card.</section>';
+  }
+  return `
+    <section class="card">
+      <h2>CV gaps</h2>
+      <p class="muted">Skills that show up across the jobs you’ve saved, ranked by how often they’re a must-have. Suggestions only rephrase work already on your CV — nothing is invented.
+      ${gapData.totalJobs < 20 ? ` Based on ${plural(gapData.totalJobs, 'scored job')} so far; the ranking gets more reliable around 20–30.` : ''}</p>
+      <div class="toolbar">
+        <input data-filter="q" data-list="gaps" placeholder="Search a skill…" value="${esc(f.q)}">
+        <select data-filter="list" data-list="gaps">
+          <option value="all" ${f.list === 'all' ? 'selected' : ''}>All jobs</option>
+          <option value="wishlist" ${f.list === 'wishlist' ? 'selected' : ''}>Wishlist only</option>
+          <option value="applied" ${f.list === 'applied' ? 'selected' : ''}>Applied only</option>
+        </select>
+      </div>
+      <p class="muted small"><label class="inline"><input type="checkbox" data-filter="longShots" data-list="gaps" ${f.longShots ? 'checked' : ''}> Count long-shot jobs (under 45% fit) at full weight</label></p>
+    </section>
+    ${shown.map(gapCard).join('') || '<section class="card empty">No gaps for this filter. Either your CV covers these jobs, or try a broader filter.</section>'}
+    ${visible.length > 15 && !gapShowAll ? `<p><button class="secondary" data-action="showMoreGaps">Show ${visible.length - 15} more</button></p>` : ''}
+    ${hidden.length ? `<section class="card"><h2>Hidden (${hidden.length})</h2><p class="muted small">Marked as not true for you.</p>${hidden.map((g) => `<div class="gap-mini">${esc(g.name)} <button class="small secondary" data-action="restoreGap" data-gap="${esc(g.id)}">Restore</button></div>`).join('')}</section>` : ''}
+  `;
+}
+
+function gapCard(g) {
+  const open = gapOpen === g.id;
+  const impact = g.impact
+    ? `If you showed this: ${g.impact.avgBefore}% → ${g.impact.avgAfter}% on ${plural(g.impact.jobs, 'job')}`
+    : '';
+  const a = g.advice;
+  return `<article class="card gap ${open ? 'open' : ''}" data-id="${esc(g.id)}">
+    <div class="job-head" data-action="toggleGap">
+      <div class="job-title">
+        <b>${esc(g.name)}</b>
+        <div class="meta">${g.jobCount} of ${gapData.totalJobs} jobs · must-have in ${g.mustHaveJobs} · ${g.missing} missing, ${g.partial} partial${impact ? ` · ${impact}` : ''}</div>
+      </div>
+    </div>
+    ${open ? `<div class="job-body">
+      <p class="muted small">How postings phrase it: ${g.phrases.map((p) => `<span class="chip">${esc(p)}</span>`).join(' ')}</p>
+      <h4>Jobs that ask for this</h4>
+      <ul class="gap-jobs">${g.jobs.map((j) => `<li><b>${esc(j.role || 'Job')}</b> · ${esc(j.company || '')} · ${j.score}% · ${j.kind === 'must' ? 'must-have' : 'nice-to-have'} · ${j.match}</li>`).join('')}</ul>
+      ${a ? adviceHtml(a) : `<button class="small" data-action="adviseGap">Suggest a CV line from my experience</button>`}
+      <div class="actions"><button class="small secondary" data-action="dismissGap">Not true for me</button></div>
+    </div>` : ''}
+  </article>`;
+}
+
+function adviceHtml(a) {
+  const label = HONESTY[a.honesty] || a.honesty;
+  return `<div class="advice ${esc(a.honesty)}">
+    <p><b>${esc(label)}</b></p>
+    ${a.why ? `<p>${esc(a.why)}</p>` : ''}
+    ${a.originalLine ? `<p class="muted small">From your CV: “${esc(a.originalLine)}”</p>` : ''}
+    ${a.rewrittenLine ? `<pre class="jd">${esc(a.rewrittenLine)}</pre><button class="small" data-action="copyAdvice">Copy rewrite</button>` : ''}
+  </div>`;
+}
+
 // ---------- actions ----------
 
 const draftValue = (key) => (drafts[key] ?? $(`[data-draft="${key}"]`)?.value ?? '').trim();
@@ -793,6 +944,48 @@ const actions = {
     }
   },
 
+  toggleGap(id) {
+    gapOpen = gapOpen === id ? null : id;
+    render();
+  },
+
+  showMoreGaps() {
+    gapShowAll = true;
+    render();
+  },
+
+  async adviseGap(id) {
+    toast('Writing a CV line from your experience…');
+    const advice = await api(`/api/gaps/${id}/advise`, { method: 'POST' });
+    const g = gapData.gaps.find((x) => x.id === id);
+    if (g) g.advice = advice;
+    gapOpen = id;
+    render();
+  },
+
+  async dismissGap(id) {
+    await api(`/api/gaps/${id}/dismiss`, { method: 'POST', body: { dismissed: true } });
+    const g = gapData.gaps.find((x) => x.id === id);
+    if (g) g.dismissed = true;
+    if (gapOpen === id) gapOpen = null;
+    render();
+  },
+
+  async restoreGap(_id, el) {
+    const id = el.dataset.gap;
+    await api(`/api/gaps/${id}/dismiss`, { method: 'POST', body: { dismissed: false } });
+    const g = gapData.gaps.find((x) => x.id === id);
+    if (g) g.dismissed = false;
+    render();
+  },
+
+  async copyAdvice(id) {
+    const g = gapData.gaps.find((x) => x.id === id);
+    if (!g?.advice?.rewrittenLine) return;
+    await navigator.clipboard.writeText(g.advice.rewrittenLine);
+    toast('Copied. Paste it into My CV, then save and re-score.');
+  },
+
   async rescoreAll() {
     const { queued } = await api('/api/rescore-all', { method: 'POST' });
     toast(queued ? `Re-scoring ${queued} job${queued === 1 ? '' : 's'}…` : 'No jobs to re-score.');
@@ -825,6 +1018,11 @@ document.addEventListener('click', async (e) => {
   if (tabBtn) {
     tab = tabBtn.dataset.tab;
     location.hash = tab;
+    if (tab === 'gaps') {
+      const p = loadGaps();
+      render();
+      return p.then(render).catch((err) => toast(err.message));
+    }
     return render();
   }
   const el = e.target.closest('[data-action]');
@@ -842,7 +1040,12 @@ document.addEventListener('input', (e) => {
   const el = e.target;
   if (el.dataset.draft) drafts[el.dataset.draft] = el.value;
   if (el.dataset.filter) {
-    filters[el.dataset.list][el.dataset.filter] = el.value;
+    filters[el.dataset.list][el.dataset.filter] = el.type === 'checkbox' ? (el.checked ? '1' : '') : el.value;
+    if (el.dataset.list === 'gaps') {
+      if (el.dataset.filter === 'q') return render();
+      loadGaps().then(render).catch((err) => toast(err.message));
+      return;
+    }
     $('#jobs').innerHTML = jobsHtml(el.dataset.list);
   }
 });
@@ -875,5 +1078,5 @@ document.addEventListener('focusout', () => {
   }, 0);
 });
 
-refresh(true).catch((e) => toast(e.message));
+refresh(true).then(() => (tab === 'gaps' ? loadGaps().then(render) : null)).catch((e) => toast(e.message));
 setInterval(() => refresh().catch(() => {}), POLL_MS);

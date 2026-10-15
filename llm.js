@@ -1,5 +1,6 @@
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 export const MODEL = process.env.MODEL || 'qwen2.5:7b';
+const KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || '30m';
 
 const EXTRACT_SCHEMA = {
   type: 'object',
@@ -24,44 +25,58 @@ const EXTRACT_SCHEMA = {
   ],
 };
 
-const REQUIREMENT = {
+const MATCH = { type: 'string', enum: ['yes', 'partial', 'no'] };
+
+// Requirements and CV lines are referred to by number, so the model doesn't spend output tokens repeating text the app already has.
+const LINE_MATCH = {
   type: 'object',
-  properties: {
-    requirement: { type: 'string' },
-    evidence: { type: 'string' },
-    match: { type: 'string', enum: ['yes', 'partial', 'no'] },
-  },
-  required: ['requirement', 'evidence', 'match'],
+  properties: { line: { type: 'integer' }, match: MATCH },
+  required: ['line', 'match'],
 };
 
-const ROLE = {
+const INFERRED_MATCH = {
   type: 'object',
-  properties: {
-    title: { type: 'string' },
-    start: { type: 'string' },
-    end: { type: 'string' },
-    relevant: { type: 'boolean' },
-  },
-  required: ['title', 'start', 'end', 'relevant'],
+  properties: { requirement: { type: 'string' }, line: { type: 'integer' }, match: MATCH },
+  required: ['requirement', 'line', 'match'],
 };
 
-const ASSESS_SCHEMA = {
+const exactly = (n) => ({ minItems: n, maxItems: n });
+
+function assessSchema(mustHaveCount, niceToHaveCount) {
+  return {
+    type: 'object',
+    properties: {
+      mustHave: mustHaveCount
+        ? { type: 'array', items: LINE_MATCH, ...exactly(mustHaveCount) }
+        : { type: 'array', items: INFERRED_MATCH, minItems: 1, maxItems: 6 },
+      niceToHave: { type: 'array', items: LINE_MATCH, ...exactly(niceToHaveCount) },
+      seniorityFit: { type: 'string', enum: ['under', 'match', 'over', 'unclear'] },
+      locationFit: { type: 'string', enum: ['ok', 'unclear', 'blocked'] },
+      domainFit: { type: 'string', enum: ['strong', 'some', 'none'] },
+      missingKeywords: { type: 'array', items: { type: 'string' }, maxItems: 8 },
+      suggestions: { type: 'array', items: { type: 'string' }, maxItems: 3 },
+      verdict: { type: 'string' },
+    },
+    required: [
+      'mustHave', 'niceToHave', 'seniorityFit', 'locationFit',
+      'domainFit', 'missingKeywords', 'suggestions', 'verdict',
+    ],
+  };
+}
+
+const PROFILE_SCHEMA = {
   type: 'object',
   properties: {
-    mustHave: { type: 'array', items: REQUIREMENT },
-    niceToHave: { type: 'array', items: REQUIREMENT },
-    roles: { type: 'array', items: ROLE },
-    seniorityFit: { type: 'string', enum: ['under', 'match', 'over', 'unclear'] },
-    locationFit: { type: 'string', enum: ['ok', 'unclear', 'blocked'] },
-    domainFit: { type: 'string', enum: ['strong', 'some', 'none'] },
-    missingKeywords: { type: 'array', items: { type: 'string' } },
-    suggestions: { type: 'array', items: { type: 'string' } },
-    verdict: { type: 'string' },
+    roles: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { title: { type: 'string' }, company: { type: 'string' }, start: { type: 'string' }, end: { type: 'string' } },
+        required: ['title', 'company', 'start', 'end'],
+      },
+    },
   },
-  required: [
-    'mustHave', 'niceToHave', 'roles', 'seniorityFit', 'locationFit',
-    'domainFit', 'missingKeywords', 'suggestions', 'verdict',
-  ],
+  required: ['roles'],
 };
 
 const EXTRACT_PROMPT = `You extract structured data from a job posting. Use only information stated in the text.
@@ -75,18 +90,61 @@ const EXTRACT_PROMPT = `You extract structured data from a job posting. Use only
 - interviewRounds: number of interview stages if the posting describes its interview process (count each listed stage), otherwise null.
 - isJobDescription: false if the text is a login page, error page, list of search results, or anything other than a single job posting.`;
 
-const ASSESS_PROMPT = `You are a strict recruiter screening a candidate's CV against one job. Judge only from evidence in the CV and candidate notes; never assume skills that are not shown.
-- For every listed requirement, in the same order, write evidence first (a short quote from the CV, or "" if none), then match:
+const ASSESS_RULES = `You are a strict recruiter screening the candidate's CV (below) against one job (in the next message). Judge only from evidence in the CV and candidate notes; never assume skills that are not shown.
+- mustHave / niceToHave: one entry per listed requirement, in the same order. line = the number of the CV line that best shows it (0 if none), then match:
   "yes" = the CV names this skill/tool/qualification (or an obvious equivalent, e.g. "Postgres" for PostgreSQL) in a job, project, or skills list.
   "partial" = the CV only shows something adjacent (e.g. ECS for Kubernetes, RabbitMQ for Kafka).
   "no" = nothing related in the CV.
-- roles: every job in the CV with start and end as "YYYY-MM" (use "present" for current roles; use "-01" if only the year is given). relevant = true if it is a professional role in the same field as this job.
 - seniorityFit: candidate level versus the role's level.
 - locationFit: "blocked" only if the job clearly requires a location or work authorization that the candidate notes say they lack; "unclear" if it can't be determined; otherwise "ok".
 - domainFit: experience in the same industry or product area.
-- missingKeywords: important skills, tools, or qualifications from the job description absent from the CV, at most 8.
-- suggestions: 1-3 specific, truthful CV edits that would improve fit for this job. Never suggest inventing experience.
+- missingKeywords: important skills or tools the job asks for that the CV lacks, as 1-4 word phrases.
+- suggestions: 1-3 specific, truthful CV edits that would improve fit for this job, one sentence each. Never suggest inventing experience.
 - verdict: one sentence on how likely this CV is to get an interview and why.`;
+
+const PROFILE_PROMPT = `List every job or position in the CV, most recent first. start and end as "YYYY-MM" (end "present" for current roles; use "-01" if only the year is given). Do not include education.`;
+
+const CHROME_LINE = /^(apply|save|join or sign in|email or phone|password|show|forgot password|sign in|sign in with|or|new to linkedin|report this job|see who |\d+\s+(applicants|weeks? ago|days? ago|hours? ago)|join now)$/i;
+const DROP_SECTION = /^(perks?|benefits?|why\b|about us|about the company|about \w+$|company overview|life at|our (culture|values|privacy)|privacy|eeo|equal opportunit|anti-discrim|accommodations?|inclusive hiring|safe hiring|what we stand for|values|the extras|a bit about us|the core values|how we use ai|newsroom|referral|relocation|position type|travel requirements?|department overview|aperçu|visit our)/i;
+const KEEP_SECTION = /^(about the role|the role|the (winning )?recipe|role overview|role purpose|responsibilit|what you.?ll|what you bring|what we.?re looking|qualif|skills?|requirements?|must-have|nice to have|preferred|bonus|interview|hiring process|location|compensation range|salary|essential|your skills|experience|basic (qualif|requirements)|key responsibilities|required|the opportunity)/i;
+const CLUE_LINE = /\b(remote|hybrid|onsite|on-site|visa|sponsor(ship)?|work.?auth|citizen|permanent resident|eligib|salary|compensation|\$\d|€|£|CAD|USD|GBP|\d\+?\s*years?)\b/i;
+
+function isHeading(line) {
+  return line.length < 60 && !/[.?!]$/.test(line) && (KEEP_SECTION.test(line) || DROP_SECTION.test(line) || /^[A-Z][\w /&'-]{2,50}$/.test(line));
+}
+
+// Drop legal, benefits and site chrome. Keep role, requirements, location, salary and interview process.
+export function cleanJd(text) {
+  const lines = String(text || '').split('\n').map((l) => l.replace(/\s+/g, ' ').trim());
+  const out = [];
+  let dropping = false;
+  for (const line of lines) {
+    if (!line || line === '-') continue;
+    if (CHROME_LINE.test(line)) continue;
+    if (isHeading(line)) {
+      dropping = DROP_SECTION.test(line) && !KEEP_SECTION.test(line);
+      if (!dropping) out.push(line);
+      continue;
+    }
+    if (dropping && !CLUE_LINE.test(line)) continue;
+    out.push(line);
+  }
+  const cleaned = out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return cleaned.length >= 400 ? cleaned : String(text || '').trim();
+}
+
+export function trimCv(text) {
+  return String(text || '')
+    .split('\n')
+    .map((l) => l.replace(/\s+/g, ' ').trim())
+    .filter((l) => l && !/^(tel|phone|mobile|email|linkedin|github):/i.test(l) && !/^https?:\/\//i.test(l) && !/^[^\s]+@[^\s]+\.[a-z]{2,}$/i.test(l) && !/^\+?\d[\d\s().-]{8,}$/.test(l))
+    .join('\n');
+}
+
+export function numberedCv(text) {
+  const lines = trimCv(text).split('\n').map((l) => l.trim()).filter(Boolean);
+  return { lines, numbered: lines.map((l, i) => `${i + 1}. ${l}`).join('\n') };
+}
 
 // Streams the response: Node's fetch aborts if response headers take over 5 minutes,
 // which a non-streaming request for long output can exceed.
@@ -99,6 +157,7 @@ async function chat(system, user, schema, { maxTokens = 2048, label = 'chat' } =
       body: JSON.stringify({
         model: MODEL,
         stream: true,
+        keep_alive: KEEP_ALIVE,
         format: schema,
         options: { temperature: 0, num_ctx: 8192, num_predict: maxTokens },
         messages: [
@@ -188,7 +247,8 @@ function upgradeIfNamed(req, cvText) {
 }
 
 export async function extractDetails(jdText) {
-  const d = await chat(EXTRACT_PROMPT, `Job posting:\n\n${jdText.slice(0, 12000)}`, EXTRACT_SCHEMA, { label: 'extract' });
+  const cleaned = cleanJd(jdText);
+  const d = await chat(EXTRACT_PROMPT, `Job posting:\n\n${cleaned.slice(0, 8000)}`, EXTRACT_SCHEMA, { maxTokens: 700, label: 'extract' });
   return {
     ...d,
     yearsRequired: typeof d.yearsRequired === 'number' ? d.yearsRequired : yearsFromText(jdText),
@@ -200,42 +260,87 @@ export async function extractDetails(jdText) {
   };
 }
 
+export async function ensureProfile(cv) {
+  const key = `${cv.version}:${(cv.text || '').length}`;
+  if (cv.profile?.key === key && cv.profile.roles?.length) return cv.profile.roles;
+  const { numbered } = numberedCv(cv.text);
+  const { roles } = await chat(PROFILE_PROMPT, numbered.slice(0, 6000), PROFILE_SCHEMA, { maxTokens: 500, label: 'profile' });
+  cv.profile = { key, roles: roles || [] };
+  return cv.profile.roles;
+}
+
+function padItems(items, n) {
+  const list = Array.isArray(items) ? items.slice(0, n) : [];
+  while (n && list.length < n) list.push({ line: 0, match: 'no' });
+  return list;
+}
+
+function hydrate(items, names, lines, cvText) {
+  return items.map((item, i) => {
+    const requirement = (names?.[i] ?? item.requirement ?? '').trim();
+    const line = Number(item.line) || 0;
+    const evidence = line >= 1 && line <= lines.length ? lines[line - 1] : '';
+    const match = ['yes', 'partial', 'no'].includes(item.match) ? item.match : 'no';
+    return upgradeIfNamed({ requirement, match, evidence }, cvText);
+  }).filter((r) => r.requirement);
+}
+
 export async function assessFit(details, jdText, cv) {
+  const profile = await ensureProfile(cv);
+  const { lines, numbered } = numberedCv(cv.text);
+  const must = details.mustHave || [];
+  const nice = details.niceToHave || [];
+  const cleaned = cleanJd(jdText);
+  const clues = cleaned.split('\n').filter((l) => CLUE_LINE.test(l)).slice(0, 24).join('\n');
   const list = (items) => (items.length ? items.map((r, i) => `${i + 1}. ${r}`).join('\n') : '(none listed)');
+
+  const system = `${ASSESS_RULES}
+
+CANDIDATE CV (use these line numbers as evidence):
+${numbered.slice(0, 7000)}
+
+CANDIDATE NOTES:
+${cv.notes || '(none)'}
+
+CANDIDATE ROLES (already dated; years of experience are counted in code):
+${profile.map((r, i) => `${i + 1}. ${r.title}${r.company ? ` at ${r.company}` : ''} (${r.start} – ${r.end})`).join('\n') || '(none)'}`;
+
   const user = `JOB
 Role: ${details.role || 'unknown'}
 Company: ${details.company || 'unknown'}
 Seniority: ${details.seniority}
 Years of experience required: ${details.yearsRequired ?? 'not stated'}
 Location / work mode: ${details.location || 'unknown'} / ${details.workMode}
+Domain: ${details.domain || 'unknown'}
 
 Must-have requirements:
-${details.mustHave.length ? list(details.mustHave) : '(none listed - infer up to 6 core requirements from the description)'}
+${must.length ? list(must) : '(none listed — infer up to 6 core requirements from the clues below)'}
 
 Nice-to-have:
-${list(details.niceToHave)}
+${list(nice)}
 
-Full job description:
-${jdText.slice(0, 6000)}
+Location, work-authorization, salary and years clues from the posting:
+${clues || '(none)'}
+${must.length ? '' : `\nJob text:\n${cleaned.slice(0, 2500)}`}`;
 
-CANDIDATE CV:
-${cv.text.slice(0, 8000)}
-
-CANDIDATE NOTES:
-${cv.notes || '(none)'}`;
-
-  const a = await chat(ASSESS_PROMPT, user, ASSESS_SCHEMA, { label: 'score' });
+  const a = await chat(system, user, assessSchema(must.length, nice.length), { maxTokens: 700, label: 'score' });
   const cvText = `${cv.text}\n${cv.notes || ''}`;
+  const mustHave = hydrate(must.length ? padItems(a.mustHave, must.length) : (a.mustHave || []).slice(0, 6), must.length ? must : null, lines, cvText);
+  const niceToHave = hydrate(padItems(a.niceToHave, nice.length), nice, lines, cvText);
+  const roles = profile.map((r) => ({ ...r, relevant: true }));
   return {
-    ...a,
-    mustHave: (a.mustHave || []).map((r) => upgradeIfNamed(r, cvText)),
-    niceToHave: (a.niceToHave || []).map((r) => upgradeIfNamed(r, cvText)),
-    roles: a.roles || [],
-    candidateYears: relevantYears(a.roles || []),
+    mustHave,
+    niceToHave,
+    roles,
+    seniorityFit: a.seniorityFit,
+    locationFit: a.locationFit,
+    domainFit: a.domainFit,
+    candidateYears: relevantYears(roles),
     missingKeywords: (a.missingKeywords || [])
       .filter((k) => !/already|present in/i.test(k) && !mentions(cvText, k))
       .slice(0, 8),
     suggestions: (a.suggestions || []).slice(0, 3),
+    verdict: a.verdict || '',
   };
 }
 
@@ -321,20 +426,27 @@ const ANSWERS_PROMPT = `${COACH}
 
 const NOT_A_STAGE = /^(next round|tips|likely questions|questions|talking points|gaps|why this role|general tips)\b/i;
 
-function prepContext(details, jdText, cv, { gaps, nextRound, passedRounds }) {
+function prepSystem(cv) {
+  const { numbered } = numberedCv(cv.text);
+  return `${COACH}
+
+CANDIDATE CV (line numbers):
+${numbered.slice(0, 4000)}
+${cv.notes ? `NOTES: ${cv.notes}` : ''}`;
+}
+
+function prepContext(details, jdText, { gaps, nextRound, passedRounds, matched }) {
   return `JOB
 Role: ${details.role || 'unknown'} at ${details.company || 'unknown'}
 Seniority: ${details.seniority}
 Domain: ${details.domain || 'unknown'}
-Key requirements: ${[...details.mustHave, ...details.niceToHave].join('; ') || '(see description)'}
+Must-haves: ${(details.mustHave || []).join('; ') || '(see description)'}
+Already shown on the CV: ${matched?.length ? matched.join('; ') : '(none identified)'}
 
-Full job description:
-${jdText.slice(0, 6000)}
+Job description (trimmed):
+${cleanJd(jdText).slice(0, 2500)}
 
-CANDIDATE CV:
-${cv.text.slice(0, 6000)}
-
-CANDIDATE GAPS FOR THIS JOB:
+GAPS FOR THIS JOB:
 ${gaps.length ? gaps.map((g) => `- ${g}`).join('\n') : '(none identified)'}
 
 INTERVIEW PROGRESS:
@@ -344,7 +456,7 @@ Next round: ${nextRound?.type ? `round ${nextRound.number}, ${nextRound.type}` :
 
 export async function generatePrepProcess(details, jdText, cv, progress) {
   const fromJd = describesInterviewProcess(jdText);
-  const p = await chat(processPrompt(fromJd), prepContext(details, jdText, cv, progress), PROCESS_SCHEMA, { maxTokens: 1200, label: 'prep-process' });
+  const p = await chat(`${prepSystem(cv)}\n${processPrompt(fromJd).replace(`${COACH}\n`, '')}`, prepContext(details, jdText, progress), PROCESS_SCHEMA, { maxTokens: 900, label: 'prep-process' });
   return {
     processFromJd: fromJd,
     stages: (p.stages || []).filter((s) => !NOT_A_STAGE.test(s.name.trim())).slice(0, 8),
@@ -353,7 +465,7 @@ export async function generatePrepProcess(details, jdText, cv, progress) {
 }
 
 export async function generatePrepAnswers(details, jdText, cv, progress) {
-  const p = await chat(ANSWERS_PROMPT, prepContext(details, jdText, cv, progress), ANSWERS_SCHEMA, { maxTokens: 1800, label: 'prep-answers' });
+  const p = await chat(`${prepSystem(cv)}\n${ANSWERS_PROMPT.replace(`${COACH}\n`, '')}`, prepContext(details, jdText, progress), ANSWERS_SCHEMA, { maxTokens: 1400, label: 'prep-answers' });
   return {
     likelyQuestions: (p.likelyQuestions || []).slice(0, 8),
     talkingPoints: (p.talkingPoints || []).slice(0, 4),
@@ -362,6 +474,57 @@ export async function generatePrepAnswers(details, jdText, cv, progress) {
     questionsToAsk: (p.questionsToAsk || []).slice(0, 5),
     generalTips: (p.generalTips || []).slice(0, 4),
   };
+}
+
+const ADVICE_SCHEMA = {
+  type: 'object',
+  properties: {
+    honesty: { type: 'string', enum: ['have_it', 'close', 'not_in_experience'] },
+    originalLine: { type: 'string' },
+    rewrittenLine: { type: 'string' },
+    why: { type: 'string' },
+  },
+  required: ['honesty', 'originalLine', 'rewrittenLine', 'why'],
+};
+
+function quoteInCv(cvText, quote) {
+  if (!quote || quote.length < 12) return false;
+  const n = (s) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+  const q = n(quote);
+  const cv = n(cvText);
+  return cv.includes(q) || cv.includes(q.slice(0, Math.min(40, q.length)));
+}
+
+export async function generateGapAdvice(cv, { name, phrases, cvLines, jobPhrases }) {
+  const { numbered } = numberedCv(cv.text);
+  const system = `You help a candidate name skills they already have. Never invent tools, employers, dates or responsibilities.
+- have_it: the CV already describes this work; it just doesn't use this wording.
+- close: the CV shows related work, not this skill itself.
+- not_in_experience: nothing in the CV supports adding this. rewrittenLine must be "".
+originalLine must be copied exactly from a numbered CV line. rewrittenLine may only rephrase that line to name the skill.`;
+
+  const user = `SKILL TO NAME: ${name}
+How job descriptions say it:
+${(jobPhrases || phrases).slice(0, 6).map((p) => `- ${p}`).join('\n')}
+
+Closest CV lines:
+${(cvLines || []).slice(0, 8).map((l, i) => `${i + 1}. ${l}`).join('\n') || numbered.slice(0, 2500)}
+
+CANDIDATE NOTES:
+${cv.notes || '(none)'}`;
+
+  const a = await chat(system, user, ADVICE_SCHEMA, { maxTokens: 400, label: 'gap-advice' });
+  const honest = ['have_it', 'close', 'not_in_experience'].includes(a.honesty) ? a.honesty : 'not_in_experience';
+  const originalOk = quoteInCv(cv.text, a.originalLine);
+  if (honest === 'not_in_experience' || !originalOk) {
+    return {
+      honesty: originalOk ? honest : 'not_in_experience',
+      originalLine: originalOk ? a.originalLine : '',
+      rewrittenLine: '',
+      why: originalOk ? a.why : 'No line in your CV clearly supports this, so it should not be added.',
+    };
+  }
+  return { honesty: honest, originalLine: a.originalLine, rewrittenLine: a.rewrittenLine || '', why: a.why || '' };
 }
 
 export async function ollamaStatus() {
