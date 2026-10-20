@@ -119,7 +119,34 @@ function jobPostingFromJsonLd(html) {
 }
 
 export function linkedInJobId(url) {
-  return url.match(/linkedin\.com\/.*?(?:jobs\/view\/(?:[^/?#]*?-)?|currentJobId=)(\d{6,})/)?.[1] || null;
+  return String(url || '').match(/linkedin\.com\/.*?(?:jobs\/view\/(?:[^/?#]*?-)?|currentJobId=)(\d{6,})/)?.[1] || null;
+}
+
+export function canonicalJobUrl(url) {
+  if (!url) return '';
+  try {
+    const u = new URL(url);
+    u.hash = '';
+    u.hostname = u.hostname.replace(/^www\./, '');
+    for (const key of [...u.searchParams.keys()]) {
+      if (/^(utm_|trk|refId|trackingId|lipi|licu|eBP|originalSubdomain|original_referer)/i.test(key) || key === 'ref') {
+        u.searchParams.delete(key);
+      }
+    }
+    const path = u.pathname.replace(/\/+$/, '') || '/';
+    const query = u.searchParams.toString();
+    return `${u.protocol}//${u.hostname}${path}${query ? `?${query}` : ''}`;
+  } catch {
+    return String(url).trim();
+  }
+}
+
+export function isSameJobUrl(a, b) {
+  if (!a || !b) return false;
+  if (canonicalJobUrl(a) === canonicalJobUrl(b)) return true;
+  const idA = linkedInJobId(a);
+  const idB = linkedInJobId(b);
+  return Boolean(idA && idB && idA === idB);
 }
 
 // The guest endpoint and the public job page are rate-limited separately, so one can work while the other returns 429.

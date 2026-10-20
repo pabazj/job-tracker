@@ -73,7 +73,19 @@ function readCapture() {
 }
 
 const linkedInId = (url) => String(url || '').match(/linkedin\.com\/.*?(?:jobs\/view\/(?:[^/?#]*?-)?|currentJobId=)(\d{6,})/)?.[1];
-const findSameJob = (url) => url && state.jobs.find((j) => j.url === url || (linkedInId(url) && linkedInId(j.url) === linkedInId(url)));
+function canonicalJobUrl(url) {
+  try {
+    const u = new URL(url);
+    u.hash = '';
+    u.hostname = u.hostname.replace(/^www\./, '');
+    return `${u.protocol}//${u.hostname}${u.pathname.replace(/\/+$/, '') || '/'}`;
+  } catch {
+    return String(url || '').trim();
+  }
+}
+const findSameJob = (url) => url && state.jobs.find((j) => j.url && (
+  canonicalJobUrl(url) === canonicalJobUrl(j.url) || (linkedInId(url) && linkedInId(url) === linkedInId(j.url))
+));
 
 function bookmarkletHref() {
   const code = `(function(){
@@ -382,7 +394,7 @@ function jobCard(j) {
     ? `<select data-field="status" class="status st-${esc(j.status)}">${options(STATUSES, j.status)}</select>`
     : '<button class="small" data-action="apply">Mark applied</button>';
 
-  return `<article class="job" data-id="${esc(j.id)}">
+  return `<article class="job${expanded.has(j.id) ? ' open' : ''}" data-id="${esc(j.id)}">
     <div class="job-head" data-action="toggle">
       ${scoreBadge(j)}
       <div class="job-title">${title}<div class="meta">${meta}</div></div>
@@ -820,6 +832,17 @@ function adviceHtml(a) {
 
 const draftValue = (key) => (drafts[key] ?? $(`[data-draft="${key}"]`)?.value ?? '').trim();
 
+async function showAddedJob(result, requestedList) {
+  const list = result.list || requestedList;
+  tab = list;
+  history.replaceState(null, '', `#${tab}`);
+  if (result.id) expanded.add(result.id);
+  if (result.duplicate === 'moved') toast('Already on your wishlist. Moved to Applied with today’s date.');
+  else if (result.duplicate) toast(list === 'applied' ? 'Already in Applied. Opened that card.' : 'Already in Wishlist. Opened that card.');
+  else toast(requestedList === 'applied' ? 'Added. Applied date set to today.' : 'Saved to wishlist.');
+  await refresh(true);
+}
+
 const actions = {
   toggle(id) {
     expanded.has(id) ? expanded.delete(id) : expanded.add(id);
@@ -832,29 +855,27 @@ const actions = {
     const input = draftValue(key);
     if (!input) return toast('Paste a job link or description first.');
     el.disabled = true;
+    let result;
     try {
-      await api('/api/jobs', { method: 'POST', body: { input, list, source: $('#pasteSource').value } });
+      result = await api('/api/jobs', { method: 'POST', body: { input, list, source: $('#pasteSource').value } });
     } finally {
       el.disabled = false;
     }
     delete drafts[key];
-    toast(list === 'applied' ? 'Added. Applied date set to today.' : 'Saved to wishlist.');
-    await refresh(true);
+    await showAddedJob(result, list);
   },
 
   async addCaptured(_id, el) {
     const list = el.dataset.list;
     el.disabled = true;
+    let result;
     try {
-      await api('/api/jobs', { method: 'POST', body: { input: `${captured.url}\n${captured.text}`, list, source: 'Auto' } });
+      result = await api('/api/jobs', { method: 'POST', body: { input: `${captured.url}\n${captured.text}`, list, source: 'Auto' } });
     } finally {
       el.disabled = false;
     }
     captured = null;
-    tab = list;
-    history.replaceState(null, '', `#${tab}`);
-    toast(list === 'applied' ? 'Added. Applied date set to today.' : 'Saved to wishlist.');
-    await refresh(true);
+    await showAddedJob(result, list);
   },
 
   dismissCapture() {

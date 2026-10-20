@@ -5,7 +5,7 @@ import { db, save } from './db.js';
 import { MODEL, assessFit, extractDetails, generatePrepAnswers, generatePrepProcess, ollamaStatus } from './llm.js';
 import { computeScore } from './scoring.js';
 import { adviseGap, dismissGap, rankGaps } from './gaps.js';
-import { checkStillOpen, detectSource, fetchJobText, parseInput } from './fetchjob.js';
+import { checkStillOpen, detectSource, fetchJobText, isSameJobUrl, parseInput } from './fetchjob.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 const MIN_JD_LENGTH = 200;
@@ -201,6 +201,18 @@ app.get('/api/state', async (_req, res) => {
   });
 });
 
+function findDuplicate(url) {
+  return url ? db.jobs.find((j) => isSameJobUrl(url, j.url)) : null;
+}
+
+function applyJob(job) {
+  job.list = 'applied';
+  job.status = 'Applied';
+  job.appliedAt = today();
+  job.appliedScore = job.analysis?.score ?? null;
+  job.appliedCvVersion = job.analysis?.cvVersion ?? null;
+}
+
 app.post('/api/jobs', (req, res) => {
   const { input = '', list, source } = req.body;
   const { url, text } = parseInput(String(input));
@@ -210,6 +222,22 @@ app.post('/api/jobs', (req, res) => {
   }
 
   const applied = list === 'applied';
+  const existing = findDuplicate(url);
+  if (existing) {
+    let duplicate = 'exists';
+    if (applied && existing.list !== 'applied') {
+      applyJob(existing);
+      duplicate = 'moved';
+    }
+    if (hasJd && !existing.jdText) {
+      existing.jdText = text;
+      existing.jdOrigin = 'pasted';
+      enqueue(existing);
+    } else {
+      save();
+    }
+    return res.json({ id: existing.id, duplicate, list: existing.list });
+  }
   const job = {
     id: crypto.randomUUID(),
     list: applied ? 'applied' : 'wishlist',
@@ -268,11 +296,7 @@ app.post('/api/jobs/:id/prep', withJob((job, _req, res) => {
 }));
 
 app.post('/api/jobs/:id/apply', withJob((job, _req, res) => {
-  job.list = 'applied';
-  job.status = 'Applied';
-  job.appliedAt = today();
-  job.appliedScore = job.analysis?.score ?? null;
-  job.appliedCvVersion = job.analysis?.cvVersion ?? null;
+  applyJob(job);
   save();
   res.json({ ok: true });
 }));
