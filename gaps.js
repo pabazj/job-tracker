@@ -11,6 +11,8 @@ const HALF_LIFE_DAYS = 60;
 const LONG_SHOT = 45;
 const LONG_SHOT_WEIGHT = 0.25;
 const NICE_WEIGHT = 0.4;
+const HIGH_SCORE = 70;
+const TWEAK_LIMIT = 8;
 const STOP = new Set('a an and as at by for from in of on or the to with using'.split(' '));
 
 db.skillGroups ??= [];
@@ -215,6 +217,109 @@ function impactFor(group, jobs) {
   return { jobs: n, avgBefore: Math.round(before / n), avgAfter: Math.round(after / n) };
 }
 
+function reachedInterview(job) {
+  return Boolean(job.reachedInterview)
+    || ['Interview', 'Offer'].includes(job.status)
+    || (job.rounds || []).length > 0;
+}
+
+function isScreeningReject(job) {
+  return job.list === 'applied'
+    && job.analysis
+    && ['Rejected', 'Ghosted'].includes(job.status)
+    && !reachedInterview(job);
+}
+
+function emptyGapRow(group) {
+  return {
+    id: group.id,
+    name: group.name,
+    phrases: new Set(),
+    jobs: new Map(),
+    mustHaveJobs: 0,
+    weight: 0,
+    yes: 0,
+    partial: 0,
+    no: 0,
+  };
+}
+
+function addGapHit(byId, job, r, kind, kindWeight) {
+  if (!r.groupId || r.match === 'yes') return;
+  const g = db.skillGroups.find((x) => x.id === r.groupId);
+  if (!g) return;
+  const row = byId.get(g.id) || emptyGapRow(g);
+  row.phrases.add(r.requirement);
+  if (!row.jobs.has(job.id)) {
+    row.jobs.set(job.id, {
+      id: job.id,
+      company: job.details?.company,
+      role: job.details?.role,
+      list: job.list,
+      score: job.analysis.score,
+      phrase: r.requirement,
+      match: r.match,
+      kind,
+    });
+    if (kind === 'must') row.mustHaveJobs++;
+  }
+  row.weight += kindWeight;
+  row[r.match] = (row[r.match] || 0) + 1;
+  byId.set(g.id, row);
+}
+
+function collectJobGaps(byId, job, mustWeight, keywordWeight = mustWeight * 0.8) {
+  for (const r of job.analysis.mustHave || []) addGapHit(byId, job, r, 'must', mustWeight);
+  for (const r of job.analysis.niceToHave || []) addGapHit(byId, job, r, 'nice', mustWeight * NICE_WEIGHT);
+  for (const m of job.analysis.missingGroups || []) {
+    if (byId.get(m.groupId)?.jobs.has(job.id)) continue;
+    addGapHit(byId, job, { requirement: m.keyword, match: 'no', groupId: m.groupId }, 'must', keywordWeight);
+  }
+}
+
+function adviceFor(cv, groupId) {
+  if (!cv) return null;
+  return db.gapAdvice[`${cv.version}:${groupId}`] || null;
+}
+
+async function rejectionInsights(cv) {
+  const jobs = db.jobs.filter(isScreeningReject);
+  for (const job of jobs) await tagJob(job);
+  const byId = new Map();
+  for (const job of jobs) {
+    const high = (job.analysis.score ?? 0) >= HIGH_SCORE ? 1.5 : 1;
+    collectJobGaps(byId, job, high, 0.8);
+  }
+  const dismissed = new Set(db.dismissedGaps);
+  const tweaks = [...byId.values()]
+    .filter((row) => !dismissed.has(row.id))
+    .sort((a, b) => b.weight - a.weight || b.jobs.size - a.jobs.size || b.mustHaveJobs - a.mustHaveJobs)
+    .slice(0, TWEAK_LIMIT)
+    .map((row) => ({
+      id: row.id,
+      name: row.name,
+      phrases: [...row.phrases],
+      jobCount: row.jobs.size,
+      mustHaveJobs: row.mustHaveJobs,
+      jobs: [...row.jobs.values()],
+      advice: adviceFor(cv, row.id),
+    }));
+  const scores = jobs.map((j) => j.analysis.score).filter((s) => s != null);
+  return {
+    jobCount: jobs.length,
+    highScoreCount: jobs.filter((j) => (j.analysis.score ?? 0) >= HIGH_SCORE).length,
+    avgScore: scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null,
+    jobs: jobs.map((j) => ({
+      id: j.id,
+      company: j.details?.company,
+      role: j.details?.role,
+      score: j.analysis.score,
+      status: j.status,
+    })),
+    tweaks,
+  };
+}
+
 export async function rankGaps({ list = 'all', q = '', includeLongShots = false, cv } = {}) {
   const jobs = db.jobs.filter((j) => {
     if (!j.analysis) return false;
@@ -225,50 +330,11 @@ export async function rankGaps({ list = 'all', q = '', includeLongShots = false,
     try { await embed(g.name); } catch { /* embeddings optional; Jaccard still groups */ }
   }
   for (const job of jobs) await tagJob(job);
+  const rejections = await rejectionInsights(cv);
   save();
 
   const byId = new Map();
-  for (const job of jobs) {
-    const w = jobWeight(job, includeLongShots);
-    const add = (r, kind, kindWeight) => {
-      if (!r.groupId || r.match === 'yes') return;
-      const g = db.skillGroups.find((x) => x.id === r.groupId);
-      if (!g) return;
-      const row = byId.get(g.id) || {
-        id: g.id,
-        name: g.name,
-        phrases: new Set(),
-        jobs: new Map(),
-        mustHaveJobs: 0,
-        weight: 0,
-        yes: 0,
-        partial: 0,
-        no: 0,
-      };
-      row.phrases.add(r.requirement);
-      if (!row.jobs.has(job.id)) {
-        row.jobs.set(job.id, {
-          id: job.id,
-          company: job.details?.company,
-          role: job.details?.role,
-          list: job.list,
-          score: job.analysis.score,
-          phrase: r.requirement,
-          match: r.match,
-          kind,
-        });
-        if (kind === 'must') row.mustHaveJobs++;
-      }
-      row.weight += w * kindWeight;
-      row[r.match] = (row[r.match] || 0) + 1;
-      byId.set(g.id, row);
-    };
-    for (const r of job.analysis.mustHave || []) add(r, 'must', 1);
-    for (const r of job.analysis.niceToHave || []) add(r, 'nice', NICE_WEIGHT);
-    for (const m of job.analysis.missingGroups || []) {
-      add({ requirement: m.keyword, match: 'no', groupId: m.groupId }, 'must', 0.8);
-    }
-  }
+  for (const job of jobs) collectJobGaps(byId, job, jobWeight(job, includeLongShots));
 
   const query = q.trim().toLowerCase();
   const dismissed = new Set(db.dismissedGaps);
@@ -279,7 +345,6 @@ export async function rankGaps({ list = 'all', q = '', includeLongShots = false,
       const group = db.skillGroups.find((g) => g.id === row.id);
       const jobsFor = jobs.filter((j) => row.jobs.has(j.id));
       const impact = impactFor(group, jobsFor);
-      const adviceKey = cv ? `${cv.version}:${row.id}` : null;
       return {
         id: row.id,
         name: row.name,
@@ -292,12 +357,12 @@ export async function rankGaps({ list = 'all', q = '', includeLongShots = false,
         impact,
         dismissed: dismissed.has(row.id),
         jobs: [...row.jobs.values()],
-        advice: adviceKey ? db.gapAdvice[adviceKey] || null : null,
+        advice: adviceFor(cv, row.id),
       };
     })
     .sort((a, b) => b.weight - a.weight || b.mustHaveJobs - a.mustHaveJobs);
 
-  return { gaps: rows, totalJobs: jobs.length };
+  return { gaps: rows, totalJobs: jobs.length, rejections };
 }
 
 export async function adviseGap(groupId, cv) {

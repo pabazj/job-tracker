@@ -18,7 +18,7 @@ const INTERVIEW_STATUSES = ['Interview', 'Offer'];
 const ROUND_RESULTS = ['pending', 'passed', 'failed'];
 const ROUND_FIELDS = ['type', 'date', 'result', 'notes'];
 const DETAIL_FIELDS = ['company', 'role', 'location', 'workMode', 'salary'];
-const JOB_FIELDS = ['source', 'url', 'deadline', 'priority', 'notes', 'appliedAt', 'savedAt', 'expectedRounds'];
+const JOB_FIELDS = ['source', 'url', 'deadline', 'priority', 'notes', 'appliedAt', 'savedAt', 'rejectedAt', 'expectedRounds'];
 
 const today = () => new Date().toLocaleDateString('en-CA');
 const currentCv = () => db.cvVersions.at(-1) || null;
@@ -323,8 +323,10 @@ app.patch('/api/jobs/:id', withJob((job, req, res) => {
 }));
 
 // reachedInterview stays true after a later rejection, so stats still credit the CV for getting through screening.
-function setStatus(job, status) {
+function setStatus(job, status, { at } = {}) {
   job.status = status;
+  if (status === 'Rejected') job.rejectedAt ||= at || today();
+  else job.rejectedAt = '';
   if (INTERVIEW_STATUSES.includes(status) || job.rounds.length) job.reachedInterview = true;
   else if (status === 'Applied') job.reachedInterview = false;
 }
@@ -351,7 +353,9 @@ app.patch('/api/jobs/:id/rounds/:roundId', withJob((job, req, res) => {
     if (key === 'result' && !ROUND_RESULTS.includes(value)) continue;
     if (ROUND_FIELDS.includes(key)) round[key] = String(value);
   }
-  if (req.body.result === 'failed' && job.status === 'Interview') setStatus(job, 'Rejected');
+  if (req.body.result === 'failed' && job.status === 'Interview') {
+    setStatus(job, 'Rejected', { at: round.date || today() });
+  }
   if (req.body.result && req.body.result !== 'failed' && job.status === 'Rejected' && !job.rounds.some((r) => r.result === 'failed')) {
     setStatus(job, 'Interview');
   }

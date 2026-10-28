@@ -17,10 +17,11 @@ let state = { jobs: [], cv: null, ollama: {}, model: '' };
 let lastJson = '';
 let pendingRender = false;
 let tab = ['wishlist', 'applied', 'stats', 'gaps', 'cv'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'wishlist';
-let gapData = { gaps: [], totalJobs: 0 };
+let gapData = { gaps: [], totalJobs: 0, rejections: null };
 let gapOpen = null;
 let gapShowAll = false;
 let gapBusy = false;
+let rejectionBusy = false;
 let captured = readCapture();
 const expanded = new Set();
 const openSections = new Set();
@@ -138,12 +139,13 @@ async function api(path, opts = {}) {
   return data;
 }
 
-function toast(msg) {
+function toast(msg, kind = '') {
   const el = $('#toast');
   el.textContent = msg;
+  el.classList.toggle('error', kind === 'error');
   el.classList.add('show');
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => el.classList.remove('show'), 3500);
+  toast.timer = setTimeout(() => el.classList.remove('show', 'error'), kind === 'error' ? 5000 : 3500);
 }
 
 function isEditing() {
@@ -275,7 +277,21 @@ function jobsHtml(list) {
   if (!jobs.length) {
     return `<div class="empty">${state.jobs.some((j) => j.list === list) ? 'No jobs match your filters.' : 'Nothing here yet. Paste a job above.'}</div>`;
   }
-  return jobs.map(jobCard).join('');
+
+  if (list !== 'applied' || f.status === 'Rejected') {
+    return jobs.map(jobCard).join('');
+  }
+
+  const open = jobs.filter((j) => j.status !== 'Rejected');
+  const rejected = jobs.filter((j) => j.status === 'Rejected');
+  if (!rejected.length || !open.length) {
+    return jobs.map(jobCard).join('');
+  }
+  return [
+    ...open.map(jobCard),
+    `<h3 class="list-split">Rejected <span class="count">${rejected.length}</span></h3>`,
+    ...rejected.map(jobCard),
+  ].join('');
 }
 
 function scoreBadge(j) {
@@ -389,7 +405,11 @@ function jobCard(j) {
     : `<b>${esc(j.url ? shortUrl(j.url) : 'New job')}</b>`;
   const meta = [d.location, d.workMode !== 'unknown' && d.workMode, d.salary, j.source].filter(Boolean).map(esc).join(' · ');
   const progress = j.list === 'applied' ? progressLabel(j) : '';
-  const date = (j.list === 'applied' ? `Applied ${fmtDate(j.appliedAt)}` : `Saved ${fmtDate(j.savedAt)}`) + (progress ? ` · ${esc(progress)}` : '');
+  const date = [
+    j.list === 'applied' ? `Applied ${fmtDate(j.appliedAt)}` : `Saved ${fmtDate(j.savedAt)}`,
+    j.status === 'Rejected' && j.rejectedAt ? `Rejected ${fmtDate(j.rejectedAt)}` : '',
+    progress,
+  ].filter(Boolean).map(esc).join(' · ');
   const control = j.list === 'applied'
     ? `<select data-field="status" class="status st-${esc(j.status)}">${options(STATUSES, j.status)}</select>`
     : '<button class="small" data-action="apply">Mark applied</button>';
@@ -575,7 +595,7 @@ function detailsHtml(j) {
       ${field('Salary', 'salary', d.salary)}
       ${selectField('Found on', 'source', SOURCES, j.source)}
       ${j.list === 'applied'
-        ? field('Applied on', 'appliedAt', j.appliedAt, 'date')
+        ? `${field('Applied on', 'appliedAt', j.appliedAt, 'date')}${j.status === 'Rejected' ? field('Rejected on', 'rejectedAt', j.rejectedAt, 'date') : ''}`
         : `${field('Deadline', 'deadline', j.deadline, 'date')}${selectField('Priority', 'priority', PRIORITIES, j.priority)}`}
       ${field('Job link', 'url', j.url, 'url', 'wide')}
       <label class="wide">Notes<textarea data-field="notes" rows="2">${esc(j.notes)}</textarea></label>
@@ -775,6 +795,7 @@ function gapsView() {
     return '<section class="card empty">Score a few jobs first. Gaps are built from the must-haves and nice-to-haves on each card.</section>';
   }
   return `
+    ${rejectionSection()}
     <section class="card">
       <h2>CV gaps</h2>
       <p class="muted">Skills that show up across the jobs you’ve saved, ranked by how often they’re a must-have. Suggestions only rephrase work already on your CV — nothing is invented.
@@ -793,6 +814,51 @@ function gapsView() {
     ${visible.length > 15 && !gapShowAll ? `<p><button class="secondary" data-action="showMoreGaps">Show ${visible.length - 15} more</button></p>` : ''}
     ${hidden.length ? `<section class="card"><h2>Hidden (${hidden.length})</h2><p class="muted small">Marked as not true for you.</p>${hidden.map((g) => `<div class="gap-mini">${esc(g.name)} <button class="small secondary" data-action="restoreGap" data-gap="${esc(g.id)}">Restore</button></div>`).join('')}</section>` : ''}
   `;
+}
+
+function findGap(id) {
+  return gapData.gaps.find((g) => g.id === id)
+    || gapData.rejections?.tweaks.find((g) => g.id === id);
+}
+
+function setAdvice(id, advice) {
+  const listed = gapData.gaps.find((g) => g.id === id);
+  if (listed) listed.advice = advice;
+  const tweak = gapData.rejections?.tweaks.find((g) => g.id === id);
+  if (tweak) tweak.advice = advice;
+}
+
+function rejectionSection() {
+  const r = gapData.rejections;
+  if (!r?.jobCount) return '';
+  const pending = (r.tweaks || []).filter((t) => !t.advice);
+  const jobs = r.jobs.map((j) => `${esc(j.role || 'Job')} at ${esc(j.company || 'Unknown')} (${j.score ?? '—'}%)`).join(' · ');
+  return `<section class="card">
+    <h2>CV tweaks from rejections</h2>
+    <p class="muted">Skills that showed up on jobs that screened you out — rejected or ghosted with no interview. Tweaks only rephrase a line already on your CV.
+    ${r.jobCount < 8 ? ` Early signal from ${plural(r.jobCount, 'screening rejection')}.` : ''}</p>
+    <div class="stats-grid">
+      <div class="stat"><b>${r.jobCount}</b>Screening rejections</div>
+      <div class="stat"><b>${r.highScoreCount}</b>Scored 70%+</div>
+      <div class="stat"><b>${r.avgScore == null ? '—' : `${r.avgScore}%`}</b>Avg predicted score</div>
+    </div>
+    <p class="muted small">${jobs}</p>
+    ${pending.length && !rejectionBusy ? '<p><button data-action="adviseRejectionTweaks">Suggest tweaks from rejections</button></p>' : ''}
+    ${rejectionBusy ? '<p class="muted">Writing CV lines from your experience…</p>' : ''}
+    ${r.tweaks.length
+      ? r.tweaks.map(tweakCard).join('')
+      : '<p class="muted">No wording gaps on these rejections. Domain, timing, or how the CV reads in the first lines may be why they said no.</p>'}
+  </section>`;
+}
+
+function tweakCard(t) {
+  return `<article class="tweak" data-id="${esc(t.id)}">
+    <h4>${esc(t.name)}</h4>
+    <p class="meta">${t.jobs.map((j) => `${esc(j.company || j.role || 'Job')} ${j.score ?? '—'}% · ${j.kind === 'must' ? 'must-have' : 'nice-to-have'} · ${j.match}`).join(' · ')}</p>
+    <p class="muted small">How they phrased it: ${t.phrases.map((p) => `<span class="chip">${esc(p)}</span>`).join(' ')}</p>
+    ${t.advice ? adviceHtml(t.advice) : (rejectionBusy ? '' : '<p class="muted small">Click Suggest tweaks to rewrite a CV line for this.</p>')}
+    <div class="actions"><button class="small secondary" data-action="dismissGap">Not true for me</button></div>
+  </article>`;
 }
 
 function gapCard(g) {
@@ -836,11 +902,22 @@ async function showAddedJob(result, requestedList) {
   const list = result.list || requestedList;
   tab = list;
   history.replaceState(null, '', `#${tab}`);
-  if (result.id) expanded.add(result.id);
-  if (result.duplicate === 'moved') toast('Already on your wishlist. Moved to Applied with today’s date.');
-  else if (result.duplicate) toast(list === 'applied' ? 'Already in Applied. Opened that card.' : 'Already in Wishlist. Opened that card.');
-  else toast(requestedList === 'applied' ? 'Added. Applied date set to today.' : 'Saved to wishlist.');
+  if (result.duplicate) {
+    if (result.id) expanded.add(result.id);
+    const where = list === 'applied' ? 'Applied' : 'Wishlist';
+    toast(
+      result.duplicate === 'moved'
+        ? 'This job already exists in Wishlist. Moved to Applied.'
+        : `This job already exists in ${where}.`,
+      'error',
+    );
+  } else {
+    toast(requestedList === 'applied' ? 'Added. Applied date set to today.' : 'Saved to wishlist.');
+  }
   await refresh(true);
+  if (result.duplicate && result.id) {
+    document.querySelector(`.job[data-id="${CSS.escape(result.id)}"]`)?.scrollIntoView({ block: 'nearest' });
+  }
 }
 
 const actions = {
@@ -978,16 +1055,36 @@ const actions = {
   async adviseGap(id) {
     toast('Writing a CV line from your experience…');
     const advice = await api(`/api/gaps/${id}/advise`, { method: 'POST' });
-    const g = gapData.gaps.find((x) => x.id === id);
-    if (g) g.advice = advice;
+    setAdvice(id, advice);
     gapOpen = id;
     render();
+  },
+
+  async adviseRejectionTweaks() {
+    const pending = (gapData.rejections?.tweaks || []).filter((t) => !t.advice);
+    if (!pending.length) return;
+    rejectionBusy = true;
+    render();
+    try {
+      for (const t of pending) {
+        toast(`Writing a CV line for ${t.name}…`);
+        setAdvice(t.id, await api(`/api/gaps/${t.id}/advise`, { method: 'POST' }));
+        render();
+      }
+      toast('Done. Copy a line into My CV, then save and re-score.');
+    } finally {
+      rejectionBusy = false;
+      render();
+    }
   },
 
   async dismissGap(id) {
     await api(`/api/gaps/${id}/dismiss`, { method: 'POST', body: { dismissed: true } });
     const g = gapData.gaps.find((x) => x.id === id);
     if (g) g.dismissed = true;
+    if (gapData.rejections?.tweaks) {
+      gapData.rejections.tweaks = gapData.rejections.tweaks.filter((t) => t.id !== id);
+    }
     if (gapOpen === id) gapOpen = null;
     render();
   },
@@ -1001,7 +1098,7 @@ const actions = {
   },
 
   async copyAdvice(id) {
-    const g = gapData.gaps.find((x) => x.id === id);
+    const g = findGap(id);
     if (!g?.advice?.rewrittenLine) return;
     await navigator.clipboard.writeText(g.advice.rewrittenLine);
     toast('Copied. Paste it into My CV, then save and re-score.');
@@ -1014,7 +1111,7 @@ const actions = {
   },
 
   exportCsv() {
-    const cols = ['list', 'status', 'progress', 'company', 'role', 'location', 'workMode', 'salary', 'source', 'savedAt', 'appliedAt', 'deadline', 'priority', 'score', 'scoreWhenApplied', 'cvVersion', 'gotInterview', 'expectedRounds', 'rounds', 'url', 'notes'];
+    const cols = ['list', 'status', 'progress', 'company', 'role', 'location', 'workMode', 'salary', 'source', 'savedAt', 'appliedAt', 'rejectedAt', 'deadline', 'priority', 'score', 'scoreWhenApplied', 'cvVersion', 'gotInterview', 'expectedRounds', 'rounds', 'url', 'notes'];
     const row = (j) => ({
       ...j.details,
       ...j,
